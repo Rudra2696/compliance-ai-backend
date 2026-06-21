@@ -1,72 +1,41 @@
 import json
-from datetime import datetime
-
+from datetime import datetime, timedelta
+import re
+import asyncio
+import os
+import unicodedata
 from fastapi import HTTPException
-from openai import OpenAI
-
-from app.core.config import XAI_API_KEY, XAI_MODEL, logger
+from openai import AsyncOpenAI
+from app.core.config import XAI_MODEL, XAI_BASE_URL, logger
 from app.models.schemas import AnalysisResponse
 
-# ---------------------------------------------------------------------------
-#  LLM Pipeline — Obligation Extraction & Department Mapping
-# ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are ComplianceAI, an expert regulatory compliance analyst. Your task is to analyze a compliance/policy document and extract all actionable obligations.
-
-## YOUR INSTRUCTIONS:
-
-1. **Read the entire document carefully.** Identify every regulatory obligation, requirement, mandate, or recommended action.
-
-2. **For each obligation, create a task** with:
-   - A clear, actionable title (imperative form, e.g., "Implement encryption for data at rest")
-   - A detailed description explaining what must be done, by whom, and how
-   - A priority level: "critical" (legal risk / fines), "high" (operational risk), "medium" (best practice), or "low" (nice to have)
-   - A suggested due date (YYYY-MM-DD format) based on urgency. Use dates within 1-6 months from today.
-   - The exact source clause, article, or section reference from the document
-
-3. **Dynamically identify the departments, boards, teams, or roles** that are actually responsible for compliance in this specific document — do NOT use a fixed or predefined list of departments. Read the document for organizational references (named departments, committees, boards, governing bodies, job titles, or functional units) and group the extracted tasks accordingly. For each department/group you identify:
-   - Use a clear, professional name that reflects the document's own terminology where possible (e.g., "Clinical Operations", "School Administration", "Board of Directors", "Information Security")
-   - Assign a relevant, contextual emoji as the `icon` that visually represents that group's function
-   - Assign a distinct, professional hex color as the `color` field (e.g., "#6366f1") — choose colors that are visually distinguishable from one another across all departments in the response
-   - Map each extracted task to the SINGLE most relevant department/group based on who would realistically own and execute it
-
-4. **Generate unique task IDs** by deriving a 3-4 letter uppercase abbreviation from each dynamically identified department/group name, followed by a hyphen and a zero-padded sequence number (format: ABBR-NNN). For example: "Clinical Operations" → CLIN-001, CLIN-002; "School Administration" → SCH-001, SCH-002; "Board of Directors" → BOD-001. Use the SAME abbreviation consistently for every task within that department, and number tasks sequentially starting from 001 within each department.
-
-5. **Assess the overall document** and provide:
-   - A document title (inferred from the content)
-   - The document type (e.g., "Regulatory Compliance", "Internal Policy", "Industry Standard")
-   - An overall risk level: "Low", "Medium", "High", or "Critical"
-   - An initial compliance score (0-100) representing how prepared the average organization would be
-   - An executive summary (2-3 sentences) of the key findings
-
-## OUTPUT FORMAT:
-
-You MUST respond with ONLY valid JSON. No markdown, no code fences, no explanations. Just the JSON object.
-The JSON must match this exact structure:
-
+SYSTEM_PROMPT = """You are ComplianceAI, an expert regulatory compliance analyst. You must analyze text and extract obligations.
+You MUST respond with a single, valid JSON object matching this structure exactly. Do not include markdown code fences or explanations.
+Target JSON Format:
 {
   "document": {
-    "title": "string",
-    "type": "string",
-    "pages": <number>,
-    "analyzedAt": "<ISO 8601 timestamp>",
-    "riskLevel": "Low|Medium|High|Critical",
-    "complianceScore": <0-100>
+    "title": "Clean Title of the Policy",
+    "type": "Regulatory Compliance",
+    "pages": 0,
+    "analyzedAt": "",
+    "riskLevel": "High",
+    "complianceScore": 50
   },
-  "summary": "string",
+  "summary": "2-3 sentence executive summary here.",
   "departments": [
     {
-      "name": "string",
-      "icon": "string (emoji)",
-      "color": "string (hex)",
+      "name": "Information Technology",
+      "icon": "🖥️",
+      "color": "#6366f1",
       "tasks": [
         {
-          "id": "string",
-          "title": "string",
-          "description": "string",
-          "priority": "critical|high|medium|low",
-          "dueDate": "YYYY-MM-DD",
-          "sourceClause": "string",
+          "id": "IT-001",
+          "title": "Actionable task title",
+          "description": "Detailed description of what to do.",
+          "priority": "critical",
+          "dueDate": "2026-09-01",
+          "sourceClause": "Article 32",
           "completed": false
         }
       ]
@@ -74,104 +43,344 @@ The JSON must match this exact structure:
   ]
 }
 
-## IMPORTANT RULES:
-- Extract AT LEAST 10 obligations if the document is substantive.
-- Each department should have at least 1 task if relevant obligations exist.
-- Every task MUST reference a specific clause/article/section from the document.
-- Due dates should be realistic and staggered (not all the same date).
-- The "completed" field must always be false.
-- Do NOT include any text outside the JSON object.
+Strict Rules:
+1. You must use EXACTLY these field names: 'document', 'summary', 'departments', 'name', 'icon', 'color', 'tasks', 'id', 'title', 'description', 'priority', 'dueDate', 'sourceClause', 'completed'. 
+2. The 'dueDate' MUST be a clean string in 'YYYY-MM-DD' format. If NO specific calendar deadline is explicitly written in the document text, you MUST output exactly the word "None". DO NOT invent, guess, or calculate dates.
+3. The 'priority' field must be exactly 'critical', 'high', 'medium', or 'low'.
+4. The 'completed' field must be false.
 """
 
+raw_keys = os.getenv("XAI_API_KEY", "")
 
-def analyze_with_llm(document_text: str, page_count: int) -> AnalysisResponse:
-    if not XAI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="XAI_API_KEY environment variable is not set. "
-                   "Set it to your xAI API key to enable LLM analysis."
-        )
+API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 
-    client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+_SCRIPT_INJECTION_PATTERN = re.compile(
+    r"<\s*script|javascript\s*:|on\w+\s*=|<\s*iframe|<\s*object|<\s*embed|<\s*link|"
+    r"<\s*img\s[^>]*\bonerror\b|expression\s*\(|vbscript\s*:|data\s*:\s*text/html",
+    re.IGNORECASE
+)
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    user_message = (
-        f"Today's date is {today}. The document has {page_count} pages.\n\n"
-        f"DOCUMENT TEXT:\n\n{document_text}"
+_STRIP_CATEGORIES = {"Cc", "Cf", "Cs", "Co"}
+
+_KEEP_CHARS = {"\n", "\r", "\t"}
+
+def sanitize_llm_string(value, max_length: int = 1000, field_name: str = "field") -> str:
+
+    """
+    Sanitize a single string value from LLM output.
+    Defense layers:
+    1. Type coercion (ensure it's actually a string)
+    2. Null byte rejection
+    3. Unicode normalization (NFC)
+    4. Control character stripping
+    5. Script injection pattern detection
+    6. Length enforcement
+    7. Whitespace normalization
+    """
+
+    if value is None:
+        return ""
+    
+    if not isinstance(value, str):
+        value = str(value)
+
+    if "\x00" in value:
+        logger.warning(f"Null byte detected in LLM output field '{field_name}', stripping.")
+        value = value.replace("\x00", "")
+
+    value = unicodedata.normalize("NFC", value)
+    
+    value = "".join(
+        ch for ch in value
+        if ch in _KEEP_CHARS or unicodedata.category(ch) not in _STRIP_CATEGORIES
     )
 
-    logger.info(f"Sending {len(user_message)} chars to {XAI_MODEL}...")
+    if _SCRIPT_INJECTION_PATTERN.search(value):
+        logger.warning(
+            f"Script injection pattern detected in LLM output field '{field_name}'. "
+            f"Neutralizing payload."
+        )
+        value = value.replace("<", "&lt;").replace(">", "&gt;")
+        
+    if len(value) > max_length:
+        logger.warning(
+            f"LLM output field '{field_name}' truncated from {len(value)} to {max_length} chars."
+        )
+        value = value[:max_length]
+
+    return value.strip()
+
+def sanitize_llm_int(value, default: int = 0, min_val: int = 0, max_val: int = 100) -> int:
+    
+    """Safely coerce LLM output to a bounded integer."""
+
+    if isinstance(value, dict):
+        value = next(iter(value.values()), default)
 
     try:
-        response = client.chat.completions.create(
+        result = int(value)
+        return max(min_val, min(result, max_val))
+    
+    except (ValueError, TypeError):
+        return default
+    
+def clean_llm_json(data: dict) -> dict:
+    """
+    Sanitize and normalize raw LLM JSON output into a clean structure
+    that matches our Pydantic schemas. Every string is sanitized,
+    every number is bounded, and every enum is validated.
+    """
+
+    if not isinstance(data, dict):
+        logger.error(f"LLM returned non-dict type: {type(data)}")
+        return {"document": {}, "departments": []}
+    doc_raw = data.get("document", {})
+
+    if not isinstance(doc_raw, dict):
+        doc_raw = {}
+    risk_level = sanitize_llm_string(
+        doc_raw.get("riskLevel") or doc_raw.get("risklevel") or "Medium",
+        max_length=20, field_name="document.riskLevel"
+    ).capitalize()
+
+    if risk_level not in ("Low", "Medium", "High", "Critical"):
+        risk_level = "High"
+    cleaned = {
+        "document": {
+            "title": sanitize_llm_string(
+                doc_raw.get("title") or doc_raw.get("documentTitle") or "Compliance Policy Document",
+                max_length=500, field_name="document.title"
+            ),
+            "type": sanitize_llm_string(
+                doc_raw.get("type") or doc_raw.get("documentType") or "Regulatory Compliance",
+                max_length=200, field_name="document.type"
+            ),
+            "pages": 0,
+            "analyzedAt": "",
+            "riskLevel": risk_level,
+            "complianceScore": sanitize_llm_int(
+                doc_raw.get("complianceScore") or doc_raw.get("riskScore") or 50,
+                default=50, min_val=0, max_val=100
+            )
+        },
+        "summary": sanitize_llm_string(
+            data.get("summary") or data.get("executiveSummary") or "Analysis complete.",
+            max_length=10000, field_name="summary"
+        ),
+        "departments": []
+    }
+
+    raw_depts = data.get("departments") or data.get("complianceObligations") or []
+
+    if not isinstance(raw_depts, list):
+        raw_depts = []
+
+    for idx, d in enumerate(raw_depts[:50]):
+        if not isinstance(d, dict):
+            continue
+        
+        dept_name = sanitize_llm_string(
+            d.get("name") or d.get("departmentName") or f"Operations Group {idx+1}",
+            max_length=200, field_name=f"departments[{idx}].name"
+        )
+
+        dept_icon = sanitize_llm_string(
+            d.get("icon") or d.get("departmentIcon") or "📋",
+            max_length=10, field_name=f"departments[{idx}].icon"
+        )
+
+        dept_color = sanitize_llm_string(
+            d.get("color") or d.get("hexColor") or d.get("departmentHexColor") or "#6366f1",
+            max_length=20, field_name=f"departments[{idx}].color"
+        )
+
+        if not re.match(r"^#[0-9a-fA-F]{3,8}$", dept_color):
+            dept_color = "#6366f1"
+
+        cleaned_tasks = []
+
+        raw_tasks = d.get("tasks") or d.get("obligations") or []
+
+        if not isinstance(raw_tasks, list):
+            raw_tasks = []
+
+        for t_idx, t in enumerate(raw_tasks[:100]):
+
+            if not isinstance(t, dict):
+                continue
+
+            raw_date = sanitize_llm_string(
+                t.get("dueDate") or t.get("duedate") or "",
+                max_length=20, field_name=f"task[{t_idx}].dueDate"
+            )
+
+            if raw_date.lower() == "none":
+                raw_date = ""
+
+            if raw_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
+                raw_date = ""
+            priority = sanitize_llm_string(
+                t.get("priority") or "medium",
+                max_length=20, field_name=f"task[{t_idx}].priority"
+            ).lower()
+
+            if priority not in ("critical", "high", "medium", "low"):
+                priority = "medium"
+            task_id = sanitize_llm_string(
+                t.get("id") or t.get("taskID") or f"TASK-{idx+1:03d}",
+                max_length=20, field_name=f"task[{t_idx}].id"
+            )
+            task_id = re.sub(r"[^A-Za-z0-9\-]", "", task_id)
+
+            if not task_id:
+                task_id = f"TASK-{idx+1:03d}"
+            cleaned_tasks.append({
+                "id": task_id,
+                "title": sanitize_llm_string(
+                    t.get("title") or t.get("taskTitle") or "Compliance Requirement",
+                    max_length=500, field_name=f"task[{t_idx}].title"
+                ),
+                "description": sanitize_llm_string(
+                    t.get("description") or t.get("taskDescription") or "No further description provided.",
+                    max_length=5000, field_name=f"task[{t_idx}].description"
+                ),
+                "priority": priority,
+                "dueDate": raw_date,
+                "sourceClause": sanitize_llm_string(
+                    t.get("sourceClause") or t.get("sourceReference") or "General Terms",
+                    max_length=500, field_name=f"task[{t_idx}].sourceClause"
+                ),
+                "completed": False
+            })
+
+        cleaned["departments"].append({
+            "name": dept_name,
+            "icon": dept_icon,
+            "color": dept_color,
+            "tasks": cleaned_tasks
+        })
+
+    return cleaned
+
+def chunk_text(text: str, chunk_size_chars: int = 14000) -> list[str]:
+
+    words = text.split()
+
+    chunks = []
+
+    current_chunk = []
+
+    current_length = 0
+
+    for word in words:
+
+        if current_length + len(word) > chunk_size_chars:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = len(word)
+
+        else:
+            current_chunk.append(word)
+            current_length += len(word) + 1 
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+async def process_single_chunk(chunk: str, chunk_index: int, total_chunks: int, api_key: str, today: str) -> dict:
+    """Worker function that handles a single chunk with a specific API key concurrently."""
+    client = AsyncOpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+    user_message = f"Today's date is {today}. Analyzing Part {chunk_index+1} of {total_chunks}.\n\nDOCUMENT TEXT:\n\n{chunk}"
+
+    try:
+        response = await client.chat.completions.create(
             model=XAI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.2,       # Low temperature for consistent, structured output
-            max_tokens=8000,       # Allow lengthy responses for many obligations
-            response_format={"type": "json_object"},  # Enforce JSON output mode
+            temperature=0.1,       
+            max_tokens=8000,       
+            response_format={"type": "json_object"},  
         )
-
         raw_content = response.choices[0].message.content
-        logger.info(f"LLM response received: {len(raw_content)} chars")
 
-        # Parse the JSON response
-        parsed = json.loads(raw_content)
+        if response.usage:
+            logger.info(f"Chunk {chunk_index+1} Token Usage: {response.usage.total_tokens} total tokens (Prompt: {response.usage.prompt_tokens}, Completion: {response.usage.completion_tokens})")
 
-        # Inject actual page count and timestamp
-        parsed["document"]["pages"] = page_count
-        parsed["document"]["analyzedAt"] = datetime.now().isoformat()
+        try:
+            parsed = json.loads(raw_content)
 
-        # Validate against our Pydantic schema
-        result = AnalysisResponse(**parsed)
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM returned invalid JSON: {e}")
-        raise HTTPException(status_code=500, detail="LLM returned invalid JSON. Please retry.")
+        except json.JSONDecodeError as e:
+            logger.error(f"Chunk {chunk_index+1}: LLM returned invalid JSON: {e}")
+            return {"departments": [], "document": {}}
+        
+        if not isinstance(parsed, dict):
+            logger.error(f"Chunk {chunk_index+1}: LLM returned non-dict JSON type: {type(parsed)}")
+            return {"departments": [], "document": {}}
+        
+        return clean_llm_json(parsed)
+    
     except Exception as e:
-        # Keep internal logs detailed, but send a generic response to the client
-        logger.error(f"LLM analysis failed: {e}")
-        raise HTTPException(status_code=500, detail="An internal server error occurred")
+        logger.error(f"Chunk {chunk_index+1} failed with key ending in ...{api_key[-4:]}: {e}")
+        return {"departments": [], "document": {}}
+    
+async def analyze_with_llm(document_text: str, page_count: int) -> AnalysisResponse:
 
-
-# ---------------------------------------------------------------------------
-#  Alternative: LangChain Pipeline (drop-in replacement for analyze_with_llm)
-# ---------------------------------------------------------------------------
-
-def analyze_with_langchain(document_text: str, page_count: int) -> AnalysisResponse:
-    from langchain_openai import ChatOpenAI
-    from langchain_core.messages import SystemMessage, HumanMessage
-    from langchain_core.output_parsers import JsonOutputParser
-
-    llm = ChatOpenAI(
-        model=XAI_MODEL,
-        temperature=0.2,
-        max_tokens=8000,
-        api_key=XAI_API_KEY,
-        base_url="https://api.x.ai/v1",
-        model_kwargs={"response_format": {"type": "json_object"}},
-    )
-
-    parser = JsonOutputParser(pydantic_object=AnalysisResponse)
-
+    if not API_KEYS:
+        raise HTTPException(status_code=500, detail="No API Keys configured. Please add keys to your .env file.")
+    
     today = datetime.now().strftime("%Y-%m-%d")
 
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=(
-            f"Today's date is {today}. The document has {page_count} pages.\n\n"
-            f"DOCUMENT TEXT:\n\n{document_text}"
-        )),
-    ]
+    text_chunks = chunk_text(document_text)
 
-    response = llm.invoke(messages)
-    parsed = parser.parse(response.content)
+    logger.info(f"Split document into {len(text_chunks)} chunks. Processing in parallel using {len(API_KEYS)} keys.")
+   
+    master_data = {
+        "document": {
+            "title": "Compliance Analysis Report",
+            "type": "Regulatory Document",
+            "pages": page_count,
+            "analyzedAt": datetime.now().isoformat(),
+            "riskLevel": "Medium",
+            "complianceScore": 50
+        },
+        "summary": "Comprehensive analysis across all document sections.",
+        "departments": []
+    }
 
-    # Inject metadata
-    parsed["document"]["pages"] = page_count
-    parsed["document"]["analyzedAt"] = datetime.now().isoformat()
+    tasks = []
 
-    return AnalysisResponse(**parsed)
+    for i, chunk in enumerate(text_chunks):
+        assigned_key = API_KEYS[i % len(API_KEYS)]
+        tasks.append(process_single_chunk(chunk, i, len(text_chunks), assigned_key, today))
+
+    results = await asyncio.gather(*tasks)
+
+    for i, standardized_data in enumerate(results):
+
+        if not isinstance(standardized_data, dict):
+            continue
+
+        if i == 0 and standardized_data.get("document", {}).get("title"):
+            master_data["document"]["title"] = standardized_data["document"].get("title", "Compliance Analysis Report")
+            master_data["document"]["riskLevel"] = standardized_data["document"].get("riskLevel", "Medium")
+
+        for new_dept in standardized_data.get("departments", []):
+
+            if not isinstance(new_dept, dict):
+                continue
+
+            existing_dept = next((d for d in master_data["departments"] if d["name"] == new_dept["name"]), None)
+
+            if existing_dept:
+                existing_dept["tasks"].extend(new_dept.get("tasks", []))
+
+            else:
+                master_data["departments"].append(new_dept)
+
+    if not master_data["departments"]:
+        raise HTTPException(status_code=500, detail="LLM failed to extract any tasks from the document chunks.")
+    
+    return AnalysisResponse(**master_data)
