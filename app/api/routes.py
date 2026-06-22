@@ -11,8 +11,7 @@ from app.core.config import MAX_PDF_SIZE_MB, logger, ADMIN_API_KEY
 from app.models.schemas import AnalysisResponse
 from app.services.pdf_parser import extract_text_from_pdf
 from app.services.llm_engine import analyze_with_llm
-from app.models.database import get_db, ComplianceTask
-from sqlalchemy.orm import Session
+
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -84,34 +83,7 @@ def validate_content_type(content_type: str | None) -> None:
             detail=f"Invalid Content-Type '{content_type}'. Only PDF files are accepted."
         )
 
-def sanitize_string_for_db(value: str, max_length: int = 1000, field_name: str = "field") -> str:
-    """
-    Sanitize a string before writing to the database.
-    - Rejects null bytes (SQL injection via null byte truncation)
-    - Strips control characters except newlines/tabs
-    - Enforces maximum length
-    - Normalizes Unicode
-    Note: SQLAlchemy's ORM uses parameterized queries, which prevents
-    classical SQL injection. This function guards against edge cases
-    like null byte truncation and stored XSS payloads.
-    """
 
-    if not isinstance(value, str):
-        value = str(value)
-
-    if "\x00" in value:
-        raise ValueError(f"Null bytes not allowed in {field_name}")
-
-    value = unicodedata.normalize("NFC", value)
-
-    value = "".join(
-        ch for ch in value
-        if ch in ("\n", "\r", "\t") or not unicodedata.category(ch).startswith("C")
-    )
-    
-    if len(value) > max_length:
-        value = value[:max_length]
-    return value.strip()
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     """
@@ -155,7 +127,6 @@ async def analyze_document(
     request: Request,
     file: UploadFile = File(...),
     api_key: str = Depends(verify_api_key),
-    db: Session = Depends(get_db)
 ):
     safe_filename = sanitize_filename(file.filename)
 
@@ -196,33 +167,6 @@ async def analyze_document(
         raise HTTPException(status_code=400, detail="Could not extract sufficient text from the PDF.")
 
     result = await analyze_with_llm(document_text, page_count)
-
-    try:
-        for dept in result.departments:
-
-            for task in dept.tasks:
-
-                db_task = ComplianceTask(
-                    id=sanitize_string_for_db(task.id, max_length=20, field_name="task.id"),
-                    department_name=sanitize_string_for_db(dept.name, max_length=200, field_name="dept.name"),
-                    title=sanitize_string_for_db(task.title, max_length=500, field_name="task.title"),
-                    description=sanitize_string_for_db(task.description, max_length=5000, field_name="task.description"),
-                    priority=sanitize_string_for_db(task.priority, max_length=20, field_name="task.priority"),
-                    due_date=sanitize_string_for_db(task.dueDate, max_length=20, field_name="task.dueDate"),
-                    source_clause=sanitize_string_for_db(task.sourceClause, max_length=500, field_name="task.sourceClause"),
-                    completed=bool(task.completed)
-                )
-                db.merge(db_task)
-
-        db.commit()
-
-    except ValueError as e:
-        db.rollback()
-        logger.error(f"Input sanitization rejected a value: {e}")
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database sync failed: {e}")
 
     return result
 

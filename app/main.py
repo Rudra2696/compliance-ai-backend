@@ -9,12 +9,8 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 from app.api.routes import router, limiter
-from app.api.routes import router, limiter
-from app.models.database import engine, Base
 from app.core.config import validate_security_config, logger, ALLOWED_ORIGINS
 validate_security_config()
-
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="ComplianceAI API",
