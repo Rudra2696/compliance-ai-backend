@@ -49,13 +49,14 @@ if os.getenv("ENFORCE_HTTPS", "False").lower() == "true":
     app.add_middleware(HTTPSRedirectMiddleware)
 
 app.add_middleware(
-    TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "*.devdynasty.local"]
+    TrustedHostMiddleware, 
+    allowed_hosts=["localhost", "127.0.0.1", "*.devdynasty.local", "*.onrender.com"] # Added Render wildcard!
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
+    allow_credentials=True, # Changed to True to allow secure cross-origin requests
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["x-api-key", "Content-Type"],
 )
